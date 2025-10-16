@@ -1,3 +1,4 @@
+
 """Pipeline for two-stage FDN optimization.
 
 This script first trains the colorless FDN configuration to learn the input, output,
@@ -122,9 +123,38 @@ def perform_decayfitnet_analysis(
         rir, analyse_full_rir=True
     )
 
-    t60 = np.asarray(estimated_parameters[0], dtype=np.float64)
-    amplitude = np.asarray(estimated_parameters[1], dtype=np.float64)
-    noise_floor = np.asarray(estimated_parameters[2], dtype=np.float64)
+    def _to_numpy_2d(name: str, value) -> np.ndarray:
+        if torch.is_tensor(value):
+            value = value.detach().cpu().numpy()
+        array = np.asarray(value, dtype=np.float64)
+        if array.ndim == 0:
+            return array.reshape(1, 1)
+        if array.ndim == 1:
+            return array.reshape(-1, 1)
+        if array.ndim == 2:
+            return array
+        raise ValueError(
+            f"Expected DecayFitNet '{name}' output to be at most 2-D, got shape {array.shape}."
+        )
+
+    def _flatten_if_singleton(array: np.ndarray) -> np.ndarray:
+        if array.ndim == 2 and array.shape[1] == 1:
+            return array[:, 0]
+        return array
+
+    norm_vals = _to_numpy_2d("norm", norm_vals)
+    t60 = _to_numpy_2d("rt60", estimated_parameters[0])
+    amplitude = _to_numpy_2d("amplitude", estimated_parameters[1])
+    noise_floor = _to_numpy_2d("noise_floor", estimated_parameters[2])
+
+    if norm_vals.shape != amplitude.shape:
+        if norm_vals.T.shape == amplitude.shape:
+            norm_vals = norm_vals.T
+        else:
+            raise ValueError(
+                "DecayFitNet returned normalisation factors with shape "
+                f"{norm_vals.shape} that are incompatible with amplitude shape {amplitude.shape}."
+            )
 
     fitted_edc = decay_model(
         torch.from_numpy(t60).to(device),
@@ -140,9 +170,6 @@ def perform_decayfitnet_analysis(
     fitted_edc = discard_last_n_percent(fitted_edc, 5)
     mse_per_band = calc_mse(true_edc, fitted_edc)
 
-    if norm_vals.shape[0] != amplitude.shape[0]:
-        norm_vals = norm_vals.transpose(1, 0)
-
     amplitude = amplitude * norm_vals
     noise_floor = noise_floor * norm_vals
 
@@ -155,19 +182,24 @@ def perform_decayfitnet_analysis(
         energy_axis = 1
     else:
         energy_axis = 0
-    band_energy = np.expand_dims(np.sum(rir_bands**2, axis=energy_axis), -1)
+    band_energy = np.sum(rir_bands**2, axis=energy_axis)
+
+    t60 = _flatten_if_singleton(t60)
+    amplitude = _flatten_if_singleton(amplitude)
+    noise_floor = _flatten_if_singleton(noise_floor)
+    norm_vals = _flatten_if_singleton(norm_vals)
 
     gain_per_sample = db2mag(rt2slope(t60, samplerate))
     decay_energy = 1 / (1 - gain_per_sample**2)
     level = np.sqrt(amplitude / band_energy / decay_energy * len(rir))
 
     return {
-        "rt60": np.asarray(t60, dtype=np.float64),
-        "amplitude": np.asarray(amplitude, dtype=np.float64),
-        "noise_floor": np.asarray(noise_floor, dtype=np.float64),
-        "norm": np.asarray(norm_vals, dtype=np.float64),
-        "initial_level": np.asarray(level, dtype=np.float64),
-        "mse": np.asarray(mse_per_band, dtype=np.float64),
+        "rt60": t60,
+        "amplitude": amplitude,
+        "noise_floor": noise_floor,
+        "norm": norm_vals,
+        "initial_level": level,
+        "mse": _flatten_if_singleton(np.asarray(mse_per_band, dtype=np.float64)),
     }
 
 # ---------------------------------------------------------------------------
@@ -182,6 +214,9 @@ def build_colorless_shell(
     device: torch.device,
 ) -> system.Shell:
     """Instantiate the colorless FDN shell used for the warm-start stage."""
+
+    delay_lengths = delay_lengths.to(device=device)
+    max_delay = int(delay_lengths.max().item())
 
     n_delays = delay_lengths.numel()
 
@@ -202,7 +237,7 @@ def build_colorless_shell(
 
     delays = dsp.parallelDelay(
         size=(n_delays,),
-        max_len=delay_lengths.max(),
+        max_len=max_delay,
         nfft=nfft,
         isint=True,
         requires_grad=False,
@@ -248,6 +283,9 @@ def build_diff_shell(
 ) -> system.Shell:
     """Instantiate the DiffFDN shell that includes the RT-controlled attenuation."""
 
+    delay_lengths = delay_lengths.to(device=device)
+    max_delay = int(delay_lengths.max().item())
+
     n_delays = delay_lengths.numel()
 
     input_gain = dsp.Gain(
@@ -267,7 +305,7 @@ def build_diff_shell(
 
     delays = dsp.parallelDelay(
         size=(n_delays,),
-        max_len=delay_lengths.max(),
+        max_len=max_delay,
         nfft=nfft,
         isint=True,
         requires_grad=False,
@@ -436,6 +474,8 @@ def prepare_target_rir(args) -> torch.Tensor:
     """Load, normalise, and window the target RIR to match the FFT size."""
 
     waveform, _ = sf.read(args.target_rir)
+    if waveform.ndim > 1:
+        waveform = waveform.mean(axis=1)
     target = torch.tensor(waveform, dtype=torch.float32)
     peak = torch.max(torch.abs(target))
     if peak > 0:
@@ -780,7 +820,7 @@ def parse_args():
     parser.add_argument(
         "--decayfitnet_path",
         type=str,
-        default=os.path.join("external", "DecayFitNet"),
+        default=os.path.join( "DecayFitNet"),
         help="Location of the DecayFitNet repository (cloned automatically if missing)",
     )
     parser.add_argument(
