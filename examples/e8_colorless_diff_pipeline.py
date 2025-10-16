@@ -377,15 +377,28 @@ def run_diff_stage(
     # ------------------------------------------------------------------
     attenuation = core.feedback_loop.feedback.attenuation
     write_band_summary(attenuation, stage_dir)
+    param_count = attenuation.param.numel()
+    band_count = attenuation.center_freq.numel()
     print(
         "Attenuation parameter count (include low/high shelves):",
-        attenuation.param.numel(),
+        param_count,
     )
     if args.initial_rt:
         init_rt = torch.tensor(args.initial_rt, dtype=attenuation.param.dtype)
-        if init_rt.numel() != attenuation.param.numel():
+        if init_rt.numel() == band_count:
+            print(
+                "Provided RT profile matches centre-band count; padding low/high shelves",
+                "with edge values.",
+            )
+            padded_rt = torch.empty(param_count, dtype=init_rt.dtype)
+            padded_rt[0] = init_rt[0]
+            padded_rt[1:-1] = init_rt
+            padded_rt[-1] = init_rt[-1]
+            init_rt = padded_rt
+        elif init_rt.numel() != param_count:
             raise ValueError(
-                "Initial RT profile length does not match attenuation parameter count"
+                "Initial RT profile length must match either the centre-band count "
+                f"({band_count}) or the attenuation parameter count ({param_count})."
             )
         attenuation.assign_value(init_rt.to(attenuation.param))
 
