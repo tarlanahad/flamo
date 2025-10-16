@@ -15,15 +15,19 @@ with a measured RT60 profile spanning octave bands from 31.25 Hz to 16 kHz::
         --band_start_hz 31.25 --band_end_hz 16000 --band_octave_interval 1 \
         --initial_rt 2.405 2.596 2.775 2.524 2.376 2.364 2.12 1.782 1.215 0.673
 
-Only the decay times are required; the initial level ("L") figures can be kept
-for downstream analysis if you extend the pipeline, but they are not consumed by
-this script.
+By default the script clones DecayFitNet, estimates octave-band RT60 and initial
+level ("L") figures from the reference RIR, and uses the RT profile to seed the
+DiffFDN attenuation. Pass ``--skip_decayfitnet`` to disable that behaviour or
+``--initial_rt`` to override the automatically recovered RT60 values.
 """
 
 import argparse
 import os
+import subprocess
+import sys
 import time
-from typing import Dict
+from pathlib import Path
+from typing import Dict, List, Optional
 
 import auraloss
 import numpy as np
@@ -53,6 +57,118 @@ class MultiResoSTFT(nn.Module):
     def forward(self, rir_a: torch.Tensor, rir_b: torch.Tensor) -> torch.Tensor:
         return self.loss(rir_a.permute(0, 2, 1), rir_b.permute(0, 2, 1))
 
+
+# ---------------------------------------------------------------------------
+# DecayFitNet integration helpers
+# ---------------------------------------------------------------------------
+
+DECAYFITNET_REPO_URL = "https://github.com/georg-goetz/DecayFitNet"
+
+
+def ensure_decayfitnet_repo(repo_path: Path, branch: Optional[str] = None) -> Path:
+    """Clone the DecayFitNet repository if it is not already present."""
+
+    repo_path = repo_path.expanduser()
+    if repo_path.exists():
+        return repo_path
+
+    repo_path.parent.mkdir(parents=True, exist_ok=True)
+    clone_cmd = ["git", "clone", "--depth", "1"]
+    if branch:
+        clone_cmd.extend(["--branch", branch])
+    clone_cmd.extend([DECAYFITNET_REPO_URL, str(repo_path)])
+    print(f"Cloning DecayFitNet into {repo_path} ...")
+    subprocess.run(clone_cmd, check=True)
+    return repo_path
+
+
+def perform_decayfitnet_analysis(
+    repo_dir: Path,
+    rir: np.ndarray,
+    samplerate: int,
+    band_frequencies: List[float],
+    n_slopes: int,
+    device: str,
+) -> Dict[str, np.ndarray]:
+    """Estimate RT60 and initial level parameters using DecayFitNet."""
+
+    if str(repo_dir) not in sys.path:
+        sys.path.insert(0, str(repo_dir))
+
+    from DecayFitNet.python.toolbox.DecayFitNetToolbox import DecayFitNetToolbox
+    from DecayFitNet.python.toolbox.utils import calc_mse
+    from DecayFitNet.python.toolbox.core import (
+        PreprocessRIR,
+        decay_model,
+        discard_last_n_percent,
+    )
+    from filters.utils import octave_filtering, db2mag, rt2slope
+
+    rir_preprocessing = PreprocessRIR(
+        sample_rate=samplerate, filter_frequencies=band_frequencies
+    )
+
+    true_edc, _ = rir_preprocessing.schroeder(rir, analyse_full_rir=True)
+    time_axis = torch.linspace(0, true_edc.shape[2] - 1, true_edc.shape[2]) / samplerate
+
+    true_edc = true_edc.permute(1, 0, 2)
+
+    decayfitnet = DecayFitNetToolbox(
+        n_slopes=n_slopes,
+        sample_rate=samplerate,
+        filter_frequencies=band_frequencies,
+    )
+    estimated_parameters, norm_vals = decayfitnet.estimate_parameters(
+        rir, analyse_full_rir=True
+    )
+
+    t60 = np.asarray(estimated_parameters[0], dtype=np.float64)
+    amplitude = np.asarray(estimated_parameters[1], dtype=np.float64)
+    noise_floor = np.asarray(estimated_parameters[2], dtype=np.float64)
+
+    fitted_edc = decay_model(
+        torch.from_numpy(t60).to(device),
+        torch.from_numpy(amplitude).to(device),
+        torch.from_numpy(noise_floor).to(device),
+        time_axis=time_axis.to(device),
+        compensate_uli=True,
+        backend="torch",
+        device=device,
+    )
+
+    true_edc = discard_last_n_percent(true_edc, 5)
+    fitted_edc = discard_last_n_percent(fitted_edc, 5)
+    mse_per_band = calc_mse(true_edc, fitted_edc)
+
+    if norm_vals.shape[0] != amplitude.shape[0]:
+        norm_vals = norm_vals.transpose(1, 0)
+
+    amplitude = amplitude * norm_vals
+    noise_floor = noise_floor * norm_vals
+
+    impulse = np.zeros((samplerate, 1))
+    impulse[0] = 1
+    rir_bands = np.asarray(octave_filtering(impulse, samplerate, band_frequencies))
+    if rir_bands.ndim == 3 and rir_bands.shape[0] == 1:
+        rir_bands = np.squeeze(rir_bands, axis=0)
+    if rir_bands.ndim == 2 and rir_bands.shape[0] == len(band_frequencies):
+        energy_axis = 1
+    else:
+        energy_axis = 0
+    band_energy = np.expand_dims(np.sum(rir_bands**2, axis=energy_axis), -1)
+
+    gain_per_sample = db2mag(rt2slope(t60, samplerate))
+    decay_energy = 1 / (1 - gain_per_sample**2)
+    level = np.sqrt(amplitude / band_energy / decay_energy * len(rir))
+
+    return {
+        "rt60": np.asarray(t60, dtype=np.float64),
+        "amplitude": np.asarray(amplitude, dtype=np.float64),
+        "noise_floor": np.asarray(noise_floor, dtype=np.float64),
+        "norm": np.asarray(norm_vals, dtype=np.float64),
+        "initial_level": np.asarray(level, dtype=np.float64),
+        "mse": np.asarray(mse_per_band, dtype=np.float64),
+    }
 
 # ---------------------------------------------------------------------------
 # Utility helpers
@@ -376,6 +492,57 @@ def run_diff_stage(
     # Step 2.2 - define/inspect attenuation bands and optionally seed their RT profile
     # ------------------------------------------------------------------
     attenuation = core.feedback_loop.feedback.attenuation
+    band_frequencies = (
+        attenuation.center_freq.detach().cpu().numpy().astype(np.float64)
+    )
+
+    decayfitnet_results: Optional[Dict[str, np.ndarray]] = None
+    if not args.skip_decayfitnet:
+        repo_dir = ensure_decayfitnet_repo(
+            Path(args.decayfitnet_path), args.decayfitnet_branch
+        )
+        waveform, waveform_sr = sf.read(args.target_rir)
+        if waveform.ndim > 1:
+            waveform = waveform.mean(axis=1)
+        if waveform_sr != args.samplerate:
+            raise ValueError(
+                "DecayFitNet analysis expects the RIR sample rate to match --samplerate"
+            )
+        waveform = waveform.astype(np.float64)
+        decayfitnet_results = perform_decayfitnet_analysis(
+            repo_dir=repo_dir,
+            rir=waveform,
+            samplerate=waveform_sr,
+            band_frequencies=band_frequencies.tolist(),
+            n_slopes=args.decayfitnet_n_slopes,
+            device=args.decayfitnet_device,
+        )
+
+        np.savetxt(
+            os.path.join(stage_dir, "decayfitnet_rt60_seconds.txt"),
+            decayfitnet_results["rt60"],
+            fmt="%.6f",
+        )
+        np.savetxt(
+            os.path.join(stage_dir, "decayfitnet_initial_level.txt"),
+            decayfitnet_results["initial_level"],
+            fmt="%.6f",
+        )
+        np.savez(
+            os.path.join(stage_dir, "decayfitnet_full_analysis.npz"),
+            **decayfitnet_results,
+            band_frequencies=band_frequencies,
+        )
+
+        print(
+            "DecayFitNet RT60 (s):",
+            ", ".join(f"{val:.3f}" for val in decayfitnet_results["rt60"]),
+        )
+        print(
+            "DecayFitNet initial levels:",
+            ", ".join(f"{val:.3f}" for val in decayfitnet_results["initial_level"]),
+        )
+
     write_band_summary(attenuation, stage_dir)
     param_count = attenuation.param.numel()
     band_count = attenuation.center_freq.numel()
@@ -383,11 +550,19 @@ def run_diff_stage(
         "Attenuation parameter count (include low/high shelves):",
         param_count,
     )
+
+    rt_seed_values: Optional[np.ndarray] = None
     if args.initial_rt:
-        init_rt = torch.tensor(args.initial_rt, dtype=attenuation.param.dtype)
+        rt_seed_values = np.asarray(args.initial_rt, dtype=np.float64)
+    elif decayfitnet_results is not None:
+        print("Seeding attenuation with DecayFitNet RT60 profile.")
+        rt_seed_values = decayfitnet_results["rt60"]
+
+    if rt_seed_values is not None:
+        init_rt = torch.tensor(rt_seed_values, dtype=attenuation.param.dtype)
         if init_rt.numel() == band_count:
             print(
-                "Provided RT profile matches centre-band count; padding low/high shelves",
+                "RT profile matches centre-band count; padding low/high shelves",
                 "with edge values.",
             )
             padded_rt = torch.empty(param_count, dtype=init_rt.dtype)
@@ -418,7 +593,7 @@ def run_diff_stage(
                 init_rt = padded_rt
         elif init_rt.numel() != param_count:
             raise ValueError(
-                "Initial RT profile length must match either the centre-band count, "
+                "RT profile length must match either the centre-band count, "
                 "that count plus one (one shelf provided), or the attenuation parameter "
                 f"count ({param_count})."
             )
@@ -596,6 +771,35 @@ def parse_args():
         nargs="*",
         default=None,
         help="Optional initial RT profile (seconds) for the attenuation bands (match the band count reported in attenuation_bands_hz.txt)",
+    )
+    parser.add_argument(
+        "--skip_decayfitnet",
+        action="store_true",
+        help="Disable automatic RT/L estimation with DecayFitNet",
+    )
+    parser.add_argument(
+        "--decayfitnet_path",
+        type=str,
+        default=os.path.join("external", "DecayFitNet"),
+        help="Location of the DecayFitNet repository (cloned automatically if missing)",
+    )
+    parser.add_argument(
+        "--decayfitnet_branch",
+        type=str,
+        default="main",
+        help="Git branch to checkout when cloning DecayFitNet",
+    )
+    parser.add_argument(
+        "--decayfitnet_n_slopes",
+        type=int,
+        default=1,
+        help="Number of decay slopes used by DecayFitNet",
+    )
+    parser.add_argument(
+        "--decayfitnet_device",
+        type=str,
+        default="cpu",
+        help="Device string passed to DecayFitNet when synthesising EDC fits",
     )
     parser.add_argument(
         "--finetune_epochs",
