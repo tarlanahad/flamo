@@ -395,10 +395,32 @@ def run_diff_stage(
             padded_rt[1:-1] = init_rt
             padded_rt[-1] = init_rt[-1]
             init_rt = padded_rt
+        elif init_rt.numel() == band_count + 1:
+            if args.band_start_hz < float(attenuation.center_freq[0]):
+                print(
+                    "Interpreting RT profile as including the low-shelf band;",
+                    "duplicating the final centre-band value for the high shelf.",
+                )
+                padded_rt = torch.empty(param_count, dtype=init_rt.dtype)
+                padded_rt[0] = init_rt[0]
+                padded_rt[1:-1] = init_rt[1:]
+                padded_rt[-1] = init_rt[-1]
+                init_rt = padded_rt
+            else:
+                print(
+                    "Interpreting RT profile as including the high-shelf band;",
+                    "duplicating the first centre-band value for the low shelf.",
+                )
+                padded_rt = torch.empty(param_count, dtype=init_rt.dtype)
+                padded_rt[0] = init_rt[0]
+                padded_rt[1:-1] = init_rt[:-1]
+                padded_rt[-1] = init_rt[-1]
+                init_rt = padded_rt
         elif init_rt.numel() != param_count:
             raise ValueError(
-                "Initial RT profile length must match either the centre-band count "
-                f"({band_count}) or the attenuation parameter count ({param_count})."
+                "Initial RT profile length must match either the centre-band count, "
+                "that count plus one (one shelf provided), or the attenuation parameter "
+                f"count ({param_count})."
             )
         attenuation.assign_value(init_rt.to(attenuation.param))
 
