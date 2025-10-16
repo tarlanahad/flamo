@@ -4,6 +4,20 @@ This script first trains the colorless FDN configuration to learn the input, out
 and feedback mixing gains. The learned parameters are then frozen and reused to
 warm-start a DiffFDN configuration whose attenuation filter (parameterized in
 reverberation times) is optimized against a target room impulse response.
+
+Example
+-------
+To run both stages against ``rirs/s3_r4_o.wav`` while seeding the attenuation
+with a measured RT60 profile spanning octave bands from 31.25 Hz to 16 kHz::
+
+    python examples/e8_colorless_diff_pipeline.py rirs/s3_r4_o.wav \
+        --device cpu \
+        --band_start_hz 31.25 --band_end_hz 16000 --band_octave_interval 1 \
+        --initial_rt 2.405 2.596 2.775 2.524 2.376 2.364 2.12 1.782 1.215 0.673
+
+Only the decay times are required; the initial level ("L") figures can be kept
+for downstream analysis if you extend the pipeline, but they are not consumed by
+this script.
 """
 
 import argparse
